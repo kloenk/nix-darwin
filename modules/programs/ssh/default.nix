@@ -52,24 +52,86 @@ in
 {
   options = {
 
-    programs.ssh.knownHosts = mkOption {
-      default = {};
-      type = types.attrsOf (types.submodule host);
-      description = ''
-        The set of system-wide known SSH hosts.
-      '';
-      example = literalExpression ''
-        [
-          {
-            hostNames = [ "myhost" "myhost.mydomain.com" "10.10.1.4" ];
-            publicKeyFile = ./pubkeys/myhost_ssh_host_dsa_key.pub;
-          }
-          {
-            hostNames = [ "myhost2" ];
-            publicKeyFile = ./pubkeys/myhost2_ssh_host_dsa_key.pub;
-          }
-        ]
-      '';
+    users.users = mkOption {
+      type = with types; attrsOf (submodule userOptions);
+    };
+
+    programs.ssh = {
+      knownHosts = mkOption {
+        default = {};
+        type = types.attrsOf (types.submodule host);
+        description = ''
+          The set of system-wide known SSH hosts.
+        '';
+        example = literalExpression ''
+          [
+            {
+              hostNames = [ "myhost" "myhost.mydomain.com" "10.10.1.4" ];
+              publicKeyFile = ./pubkeys/myhost_ssh_host_dsa_key.pub;
+            }
+            {
+              hostNames = [ "myhost2" ];
+              publicKeyFile = ./pubkeys/myhost2_ssh_host_dsa_key.pub;
+            }
+          ]
+        '';
+      };
+
+      pubkeyAcceptedKeyTypes = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "ssh-ed25519" "ssh-rsa" ];
+        description = ''
+          Specifies the key types that will be used for public key authentication.
+        '';
+      };
+
+      hostKeyAlgorithms = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "ssh-ed25519" "ssh-rsa" ];
+        description = ''
+          Specifies the host key algorithms that the client wants to use in order of preference.
+        '';
+      };
+
+      kexAlgorithms = mkOption {
+        type = types.nullOr (types.listOf types.str);
+        default = null;
+        example = [
+          "curve25519-sha256@libssh.org"
+          "diffie-hellman-group-exchange-sha256"
+        ];
+        description = ''
+          Specifies the available KEX (Key Exchange) algorithms.
+        '';
+      };
+      ciphers = mkOption {
+        type = types.nullOr (types.listOf types.str);
+        default = null;
+        example = [ "chacha20-poly1305@openssh.com" "aes256-gcm@openssh.com" ];
+        description = ''
+          Specifies the ciphers allowed and their order of preference.
+        '';
+      };
+      macs = mkOption {
+        type = types.nullOr (types.listOf types.str);
+        default = null;
+        example = [ "hmac-sha2-512-etm@openssh.com" "hmac-sha1" ];
+        description = ''
+          Specifies the MAC (message authentication code) algorithms in order of preference. The MAC algorithm is used
+          for data integrity protection.
+        '';
+      };
+
+      extraConfig = lib.mkOption {
+        type = lib.types.lines;
+        default = "";
+        description = ''
+          Extra configuration text loaded in {file}`ssh_config`.
+          See {manpage}`ssh_config(5)` for help.
+        '';
+      };
     };
   };
 
@@ -81,11 +143,42 @@ in
       message = "knownHost ${name} must contain either a publicKey or publicKeyFile";
     });
 
-    environment.etc."ssh/ssh_known_hosts".text = (flip (concatMapStringsSep "\n") knownHosts
-      (h: assert h.hostNames != [];
-        concatStringsSep "," h.hostNames + " "
-        + (if h.publicKey != null then h.publicKey else readFile h.publicKeyFile)
-      )) + "\n";
+    environment.etc = authKeysFiles //
+      { "ssh/ssh_known_hosts" = mkIf (builtins.length knownHosts > 0) {
+          text = (flip (concatMapStringsSep "\n") knownHosts
+            (h: assert h.hostNames != [];
+              lib.optionalString h.certAuthority "@cert-authority " + concatStringsSep "," h.hostNames + " "
+              + (if h.publicKey != null then h.publicKey else readFile h.publicKeyFile)
+            )) + "\n";
+        };
+        "ssh/ssh_config.d/100-nix-darwin.conf".text = ''
+          ${optionalString (cfg.pubkeyAcceptedKeyTypes != [ ])
+          "PubkeyAcceptedKeyTypes ${
+            concatStringsSep "," cfg.pubkeyAcceptedKeyTypes
+          }"}
 
+          ${config.programs.ssh.extraConfig}
+
+          ${optionalString (cfg.hostKeyAlgorithms != [ ])
+          "HostKeyAlgorithms ${concatStringsSep "," cfg.hostKeyAlgorithms}"}
+          ${optionalString (cfg.kexAlgorithms != null)
+          "KexAlgorithms ${concatStringsSep "," cfg.kexAlgorithms}"}
+          ${optionalString (cfg.ciphers != null)
+          "Ciphers ${concatStringsSep "," cfg.ciphers}"}
+          ${optionalString (cfg.macs != null)
+          "MACs ${concatStringsSep "," cfg.macs}"}
+        '';
+        "ssh/sshd_config.d/101-authorized-keys.conf" = {
+          text = ''
+            # sshd doesn't like reading from symbolic links, so we cat
+            # the file ourselves.
+            AuthorizedKeysCommand /bin/cat /etc/ssh/nix_authorized_keys.d/%u
+            # Just a simple cat, fine to use _sshd.
+            AuthorizedKeysCommandUser _sshd
+          '';
+          # Allows us to automatically migrate from using a file to a symlink
+          knownSha256Hashes = [ oldAuthorizedKeysHash ];
+        };
+      };
   };
 }
